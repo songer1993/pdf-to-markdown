@@ -1,0 +1,59 @@
+# Python specifics
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Virtual Environments
+venv/
+env/
+.env/
+.venv/
+ENV/
+
+# Jupyter Notebooks
+.ipynb_checkpoints/
+
+# Logging and Temporary Files
+*.log
+*.tmp
+*.bak
+
+# API Keys and Secrets
+.env
+*.env
+secrets.json
+
+# PDF and Large Data Files
+*.pdf
+!example_templates/*.pdf
+data/
+downloads/
+converted_markdown/
+
+# Machine Learning and Large Binary Files
+*.pkl
+*.model
+*.h5
+*.hdf5
+*.joblib
+
+# IDE and Editor Files
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# Operating System Files
+.DS_Store
+Thumbs.db
+
+# Dependency Directories
+node_modules/
+jspm_packages/
+
+# Build and Distribution
+build/
+dist/
+*.egg-info/
+*.egg
