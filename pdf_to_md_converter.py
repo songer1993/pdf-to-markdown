@@ -1,4 +1,3 @@
-#!/Users/qw246/miniforge3/envs/kb/bin/python
 import os
 import re
 from dotenv import load_dotenv
