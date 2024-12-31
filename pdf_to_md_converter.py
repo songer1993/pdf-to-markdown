@@ -6,9 +6,10 @@ import argparse
 from pathlib import Path
 from markitdown import MarkItDown
 from openai import OpenAI
-import PyPDF2
+import pypdf
 import unicodedata
 import requests
+import pdfminer.high_level
 
 # Suppress pydub ffmpeg warning
 import warnings
@@ -61,7 +62,7 @@ def extract_title_with_xai(pdf_path, xai_api_key):
     try:
         # Extract first page text for title extraction
         with open(pdf_path, 'rb') as file:
-            reader = PyPDF2.PdfReader(file)
+            reader = pypdf.PdfReader(file)
             first_page_text = reader.pages[0].extract_text()
         
         # Prepare xAI API request
@@ -98,18 +99,18 @@ def extract_title_with_xai(pdf_path, xai_api_key):
         return pdf_path.stem
 
 def fallback_pdf_extraction(pdf_path):
-    """Fallback text extraction method"""
+    """Fallback text extraction method using pypdf"""
     try:
         with open(pdf_path, 'rb') as file:
-            reader = PyPDF2.PdfReader(file)
+            reader = pypdf.PdfReader(file)
             # Extract text and clean it
             text = "\n".join(page.extract_text() for page in reader.pages)
             return clean_text(text)
     except Exception as e:
         logger.error(f"Fallback extraction failed for {pdf_path}: {e}")
         return ""
-
-def convert_pdfs_to_md(input_dir: str, output_dir: str):
+    
+# def convert_pdfs_to_md(input_dir: str, output_dir: str):
     """Convert PDF files to Markdown"""
     # Retrieve xAI API key
     xai_key = os.getenv('XAI_API_KEY')
@@ -176,6 +177,116 @@ def convert_pdfs_to_md(input_dir: str, output_dir: str):
     
     # Minimal summary
     logger.info(f"\nSummary: {converted_files}/{total_files} converted")
+
+def is_valid_pdf(pdf_path):
+    """
+    Check if the PDF file is valid and not corrupted
+    
+    Args:
+        pdf_path (Path): Path to the PDF file
+    
+    Returns:
+        bool: True if PDF is valid, False otherwise
+    """
+    try:
+        # Try to open the PDF and read its pages
+        with open(pdf_path, 'rb') as file:
+            reader = pypdf.PdfReader(file)
+            
+            # Check if the PDF has at least one page
+            if len(reader.pages) == 0:
+                logger.warning(f"Empty PDF: {pdf_path.name}")
+                return False
+            
+            # Try to extract text from the first page as a basic integrity check
+            reader.pages[0].extract_text()
+            
+            return True
+    except Exception as e:
+        logger.warning(f"Unexpected error checking PDF {pdf_path.name}: {e}")
+        return False
+
+def convert_pdfs_to_md(input_dir: str, output_dir: str):
+    """Convert PDF files to Markdown, skipping already converted files"""
+    # Retrieve xAI API key
+    xai_key = os.getenv('XAI_API_KEY')
+    
+    # Initialize Markitdown
+    markitdown = MarkItDown()
+    
+    os.makedirs(output_dir, exist_ok=True)
+    pdf_files = list(Path(input_dir).glob('*.pdf'))
+    
+    if not pdf_files:
+        logger.warning(f"No PDFs found in {input_dir}")
+        return
+    
+    total_files = len(pdf_files)
+    converted_files = 0
+    skipped_files = 0
+    
+    for pdf_path in pdf_files:
+        # Determine output filename
+        if xai_key:
+            try:
+                paper_title = extract_title_with_xai(pdf_path, xai_key)
+                output_file = Path(output_dir) / f"{clean_filename(paper_title)}.md"
+            except Exception:
+                output_file = Path(output_dir) / f"{pdf_path.stem}.md"
+        else:
+            output_file = Path(output_dir) / f"{pdf_path.stem}.md"
+        
+        # Skip if file already exists
+        if output_file.exists():
+            logger.info(f"✓ {pdf_path.name} already converted (skipping)")
+            skipped_files += 1
+            continue
+        
+        # Rest of the existing conversion logic remains the same
+        try:
+            # Primary conversion attempt
+            text_content = ""
+            conversion_methods = [
+                # Method 1: Markitdown
+                lambda: markitdown.convert(str(pdf_path)).text_content if hasattr(markitdown.convert(str(pdf_path)), 'text_content') else None,
+                
+                # Method 2: pdfminer extraction
+                lambda: pdfminer.high_level.extract_text(str(pdf_path)),
+                
+                # Method 3: Fallback pypdf extraction
+                lambda: fallback_pdf_extraction(pdf_path)
+            ]
+            
+            # Try conversion methods sequentially
+            for method in conversion_methods:
+                try:
+                    text_content = method()
+                    if text_content and text_content.strip():
+                        break
+                except Exception as method_error:
+                    logger.warning(f"Conversion method failed for {pdf_path}: {method_error}")
+            
+            # Ensure we have some content
+            if not text_content:
+                logger.warning(f"Skipping {pdf_path.name}: No text extracted")
+                skipped_files += 1
+                continue
+            
+            # Clean and write markdown file
+            cleaned_text = clean_text(text_content)
+            with open(output_file, 'w', encoding='utf-8') as f:
+                f.write(cleaned_text)
+            
+            logger.info(f"✓ {pdf_path.name} → {output_file.name}")
+            converted_files += 1
+        except Exception as e:
+            logger.error(f"✗ {pdf_path.name}: {e}")
+    
+    # Summary
+    logger.info(f"\nSummary:")
+    logger.info(f"Total files: {total_files}")
+    logger.info(f"Converted: {converted_files}")
+    logger.info(f"Skipped (already converted): {skipped_files}")
 
 def main():
     parser = argparse.ArgumentParser(description='PDF to Markdown Converter')

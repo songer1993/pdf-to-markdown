@@ -1,6 +1,6 @@
 # Core Libraries
-markitdown>=1.0.0
-PyPDF2>=3.0.0
+markitdown==0.0.1a3
+pypdf>=3.0.0
 python-dotenv>=1.0.0
 
 # Optional LLM Integration
@@ -10,7 +10,6 @@ openai>=1.0.0
 requests>=2.31.0
 
 # Development and Debugging
-logging>=0.5.1.2
 
 # Optional: Additional PDF processing
 pdfminer.six>=20231228 
