@@ -41,10 +41,18 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 
 # Constants section - group related constants
 API_CONFIG = {
-    'model': 'deepseek-chat',
-    'max_tokens': 4000,
-    'temperature': 0.1,
-    'base_url': 'https://api.deepseek.com/v1'
+    'deepseek': {
+        'model': 'deepseek-chat',
+        'max_tokens': 4000,
+        'temperature': 0.1,
+        'base_url': 'https://api.deepseek.com/v1'
+    },
+    'xai': {
+        'model': 'grok-beta',
+        'max_tokens': 4000,
+        'temperature': 0.1,
+        'base_url': 'https://api.x.ai/v1'
+    }
 }
 
 FILE_PROCESSING = {
@@ -102,12 +110,25 @@ Output ONLY the cleaned text without any explanations."""
 interrupted = False
 
 # Move API client configuration to a separate function
-def configure_api_client():
-    """Configure and return OpenAI client for DeepSeek"""
-    return openai.OpenAI(
-        api_key=os.getenv('DEEPSEEK_API_KEY'),
-        base_url="https://api.deepseek.com/v1"
-    )
+def configure_api_client(provider='deepseek'):
+    """Configure and return API client for specified provider"""
+    if provider == 'deepseek':
+        return openai.OpenAI(
+            api_key=os.getenv('DEEPSEEK_API_KEY'),
+            base_url=API_CONFIG['deepseek']['base_url']
+        )
+    elif provider == 'xai':
+        return openai.OpenAI(
+            api_key=os.getenv('XAI_API_KEY'),
+            base_url=API_CONFIG['xai']['base_url'],
+            default_headers={
+                "X-API-Version": "1.0",
+                "Content-Type": "application/json"
+            }
+        )
+    else:
+        raise ValueError(f"Unsupported API provider: {provider}")
+
 # After the constants section, initialize the OpenAI client
 client = configure_api_client()
 
@@ -128,7 +149,7 @@ def signal_handler(signum, frame):
 # Set up signal handler
 signal.signal(signal.SIGINT, signal_handler)
 
-# Improve text cleaning function
+# Add back the missing text cleaning functions that were referenced earlier
 def clean_text(text):
     """Clean and sanitize text to ensure valid UTF-8 encoding while preserving text structure"""
     if not text:
@@ -150,7 +171,6 @@ def clean_text(text):
     
     return cleaned.strip()
 
-# Improve filename cleaning
 def clean_filename(filename):
     """Clean filename to remove invalid characters and ensure proper length"""
     if not filename:
@@ -165,7 +185,6 @@ def clean_filename(filename):
     
     return cleaned or "untitled"
 
-# Update extraction methods to be more maintainable
 def extract_text_using_markitdown(pdf_path):
     """Extract text using MarkItDown"""
     return MarkItDown().convert(str(pdf_path)).text_content
@@ -193,14 +212,28 @@ EXTRACTION_METHODS = [
 ]
 
 # Improve API calls with better error handling
-def make_api_call(messages, filename):
+def make_api_call(messages, filename, provider='deepseek'):
     """Make API call with retry logic and error handling"""
     try:
+        config = API_CONFIG[provider]
+        
+        if provider == 'xai':
+            # Format messages for XAI's Grok model
+            formatted_messages = [
+                {
+                    "role": m["role"],
+                    "content": m["content"].replace("\n\n", "\n").strip()  # XAI prefers concise prompts
+                }
+                for m in messages
+            ]
+        else:
+            formatted_messages = messages
+
         response = client.chat.completions.create(
-            model=API_CONFIG['model'],
-            messages=messages,
-            max_tokens=API_CONFIG['max_tokens'],
-            temperature=API_CONFIG['temperature']
+            model=config['model'],
+            messages=[{"role": m["role"], "content": m["content"]} for m in formatted_messages],
+            max_tokens=config['max_tokens'],
+            temperature=config['temperature']
         )
         
         if not response.choices:
@@ -211,10 +244,10 @@ def make_api_call(messages, filename):
             response.usage.total_tokens if response.usage else 0
         )
     except Exception as e:
-        logger.error(f"[{filename}] API call failed: {str(e)}")
+        logger.error(f"[{filename}] API call failed ({provider}): {str(e)}")
         return "", 0
 
-def extract_title_from_text(cleaned_text, fallback_name):
+def extract_title_from_text(cleaned_text, fallback_name, provider='deepseek'):
     """Extract paper title from cleaned text using DeepSeek"""
     messages = [
         {
@@ -227,11 +260,11 @@ def extract_title_from_text(cleaned_text, fallback_name):
         }
     ]
     
-    title, tokens = make_api_call(messages, fallback_name)
+    title, tokens = make_api_call(messages, fallback_name, provider)
     return (title if title else fallback_name), tokens
 
-def clean_text_with_deepseek(text, filename):
-    """Use DeepSeek to clean and structure the extracted text"""
+def clean_text_with_ai(text, filename, provider='deepseek'):
+    """Use AI to clean and structure the extracted text"""
     total_tokens = 0
     
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=10))
@@ -247,15 +280,22 @@ def clean_text_with_deepseek(text, filename):
                 "content": chunk
             }
         ]
-        result, tokens = make_api_call(messages, filename)
+        result, tokens = make_api_call(messages, filename, provider)
         total_tokens += tokens
         return result
 
     try:
-        if len(text) > FILE_PROCESSING['max_chunk_size']:
+        # Adjust chunk size based on provider
+        max_chunk_size = (
+            FILE_PROCESSING['max_chunk_size'] 
+            if provider == 'deepseek' 
+            else FILE_PROCESSING['max_chunk_size'] // 2  # XAI typically prefers smaller chunks
+        )
+
+        if len(text) > max_chunk_size:
             chunks = [
-                text[i:i + FILE_PROCESSING['max_chunk_size']] 
-                for i in range(0, len(text), FILE_PROCESSING['max_chunk_size'])
+                text[i:i + max_chunk_size] 
+                for i in range(0, len(text), max_chunk_size)
             ]
             cleaned_chunks = []
             
@@ -279,11 +319,11 @@ def clean_text_with_deepseek(text, filename):
             return result, total_tokens
 
     except Exception as e:
-        logger.error(f"[{filename}] DeepSeek cleaning failed: {e}")
+        logger.error(f"[{filename}] AI cleaning failed ({provider}): {e}")
         return clean_text(text), total_tokens
 
 # Improve PDF processing with better error handling
-def process_pdf(pdf_path, output_dir):
+def process_pdf(pdf_path, output_dir, provider='deepseek'):
     """Process a single PDF file"""
     if interrupted:
         return False
@@ -309,13 +349,13 @@ def process_pdf(pdf_path, output_dir):
 
         # Process and save the text
         logger.info(f"[{filename}] Cleaning text...")
-        cleaned_text, cleaning_tokens = clean_text_with_deepseek(text_content, filename)
+        cleaned_text, cleaning_tokens = clean_text_with_ai(text_content, filename, provider)
         
         if interrupted:
             return False
             
         logger.info(f"[{filename}] Extracting title...")
-        paper_title, title_tokens = extract_title_from_text(cleaned_text, pdf_path.stem)
+        paper_title, title_tokens = extract_title_from_text(cleaned_text, pdf_path.stem, provider)
         
         output_file = Path(output_dir) / f"{clean_filename(paper_title)}.md"
         if output_file.exists():
@@ -349,8 +389,9 @@ class PDFProcessor:
                 if self.interrupted:
                     break
                     
-                pdf_path, output_dir = self.queue.get_nowait()
-                success = process_pdf(pdf_path, output_dir)
+                # Unpack all three values from queue
+                pdf_path, output_dir, provider = self.queue.get_nowait()
+                success = process_pdf(pdf_path, output_dir, provider)
                 
                 with self.lock:
                     if success:
@@ -367,8 +408,11 @@ class PDFProcessor:
                 break
 
 # Update the convert_pdfs_to_md function
-def convert_pdfs_to_md(input_dir: str, output_dir: str, compress_md: bool = False):
-    """Convert PDFs to Markdown with improved thread management"""
+def convert_pdfs_to_md(input_dir: str, output_dir: str, provider: str = 'deepseek'):
+    """Convert PDFs to Markdown with specified AI provider"""
+    global client
+    client = configure_api_client(provider)
+    
     os.makedirs(output_dir, exist_ok=True)
     pdf_files = list(Path(input_dir).glob('*.pdf'))
     
@@ -381,7 +425,7 @@ def convert_pdfs_to_md(input_dir: str, output_dir: str, compress_md: bool = Fals
     
     # Fill the queue
     for pdf_path in pdf_files:
-        processor.queue.put((pdf_path, output_dir))
+        processor.queue.put((pdf_path, output_dir, provider))
 
     # Create and start worker threads
     workers = []
@@ -418,8 +462,14 @@ def main():
     parser = argparse.ArgumentParser(description='PDF to Markdown Converter')
     parser.add_argument('input_dir', help='Input PDF directory')
     parser.add_argument('output_dir', help='Output Markdown directory')
+    parser.add_argument(
+        '--provider', 
+        choices=['deepseek', 'xai'], 
+        default='deepseek',
+        help='AI provider to use (default: deepseek)'
+    )
     args = parser.parse_args()
-    convert_pdfs_to_md(args.input_dir, args.output_dir)
+    convert_pdfs_to_md(args.input_dir, args.output_dir, args.provider)
 
 if __name__ == '__main__':
     main()
