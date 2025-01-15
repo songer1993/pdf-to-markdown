@@ -7,6 +7,10 @@ import unicodedata
 import signal
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import sys  # Add this import
+import threading
+import queue
+import time
 
 # Third-party imports
 import pypdf
@@ -119,7 +123,7 @@ def signal_handler(signum, frame):
         interrupted = True
     else:
         logger.info("\nForce quitting...")
-        exit(1)
+        sys.exit(1)
 
 # Set up signal handler
 signal.signal(signal.SIGINT, signal_handler)
@@ -330,9 +334,41 @@ def process_pdf(pdf_path, output_dir):
         logger.error(f"[{filename}] Failed to process: {str(e)}")
         return False
 
-# Main conversion function with improved parallel processing
+# Add a new class to manage the processing queue
+class PDFProcessor:
+    def __init__(self, max_workers):
+        self.max_workers = max_workers
+        self.queue = queue.Queue()
+        self.stats = {'converted': 0, 'skipped': 0}
+        self.lock = threading.Lock()
+        self.interrupted = False
+
+    def process_queue(self):
+        while True:
+            try:
+                if self.interrupted:
+                    break
+                    
+                pdf_path, output_dir = self.queue.get_nowait()
+                success = process_pdf(pdf_path, output_dir)
+                
+                with self.lock:
+                    if success:
+                        self.stats['converted'] += 1
+                    else:
+                        self.stats['skipped'] += 1
+                        
+                self.queue.task_done()
+                
+            except queue.Empty:
+                break
+            except Exception as e:
+                logger.error(f"Worker error: {e}")
+                break
+
+# Update the convert_pdfs_to_md function
 def convert_pdfs_to_md(input_dir: str, output_dir: str, compress_md: bool = False):
-    """Convert PDFs to Markdown with parallel processing and proper cleanup"""
+    """Convert PDFs to Markdown with improved thread management"""
     os.makedirs(output_dir, exist_ok=True)
     pdf_files = list(Path(input_dir).glob('*.pdf'))
     
@@ -341,32 +377,41 @@ def convert_pdfs_to_md(input_dir: str, output_dir: str, compress_md: bool = Fals
         return
 
     max_workers = min(FILE_PROCESSING['max_workers'], len(pdf_files))
+    processor = PDFProcessor(max_workers)
     
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {
-            executor.submit(process_pdf, pdf_path, output_dir): pdf_path 
-            for pdf_path in pdf_files
-        }
-        
-        stats = {'converted': 0, 'skipped': 0}
-        
-        try:
-            for future in as_completed(futures):
-                if interrupted:
-                    break
-                if future.result():
-                    stats['converted'] += 1
-                else:
-                    stats['skipped'] += 1
-        except KeyboardInterrupt:
-            executor.shutdown(wait=False)
-            logger.info("\nOperation interrupted by user")
-            return
-        finally:
-            logger.info("\nSummary:")
-            logger.info(f"Total files: {len(pdf_files)}")
-            logger.info(f"Converted: {stats['converted']}")
-            logger.info(f"Skipped: {stats['skipped']}")
+    # Fill the queue
+    for pdf_path in pdf_files:
+        processor.queue.put((pdf_path, output_dir))
+
+    # Create and start worker threads
+    workers = []
+    for _ in range(max_workers):
+        thread = threading.Thread(target=processor.process_queue)
+        thread.daemon = True
+        workers.append(thread)
+        thread.start()
+
+    try:
+        # Wait for all tasks to complete or interruption
+        while any(thread.is_alive() for thread in workers):
+            if interrupted:
+                processor.interrupted = True
+                break
+            time.sleep(0.1)
+
+    except KeyboardInterrupt:
+        processor.interrupted = True
+        logger.info("\nOperation interrupted by user")
+
+    finally:
+        # Wait briefly for threads to clean up
+        for thread in workers:
+            thread.join(timeout=1.0)
+            
+        logger.info("\nSummary:")
+        logger.info(f"Total files: {len(pdf_files)}")
+        logger.info(f"Converted: {processor.stats['converted']}")
+        logger.info(f"Skipped: {processor.stats['skipped']}")
 
 # Main entry point
 def main():
