@@ -1,16 +1,16 @@
-# Core Libraries
-markitdown>=1.0.0
-PyPDF2>=3.0.0
-python-dotenv>=1.0.0
+# Core Dependencies
+markitdown>=0.0.1a3
+pypdf>=3.0.0
+python-dotenv>=0.19.0
+requests>=2.26.0
 
-# Optional LLM Integration
-openai>=1.0.0
+# PDF Processing Tools
+pdfminer.six>=20221105
+pdf2image>=1.16.0
+opencv-python>=4.7.0
+camelot-py>=0.10.1
+ghostscript>=0.7
 
-# Logging and Utilities
-requests>=2.31.0
-
-# Development and Debugging
-logging>=0.5.1.2
-
-# Optional: Additional PDF processing
-pdfminer.six>=20231228 
+# Additional Dependencies
+spacy
+tqdm
