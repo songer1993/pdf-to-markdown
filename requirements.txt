@@ -3,6 +3,7 @@ markitdown>=0.0.1a3
 pypdf>=3.0.0
 python-dotenv>=0.19.0
 requests>=2.26.0
+openai>=1.0.0
 
 # PDF Processing Tools
 pdfminer.six>=20221105
@@ -12,6 +13,9 @@ camelot-py>=0.10.1
 ghostscript>=0.7
 
 # Additional Dependencies
-spacy
-tqdm
+spacy>=3.0.0
+tqdm>=4.65.0
 tenacity>=8.0.0
+
+# Optional: For better PDF text extraction
+pytesseract>=0.3.10

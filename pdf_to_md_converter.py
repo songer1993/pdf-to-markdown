@@ -9,10 +9,12 @@ from pathlib import Path
 # Third-party imports
 import pypdf
 import requests
+import openai  # Changed to use OpenAI's SDK for DeepSeek compatibility
 from dotenv import load_dotenv
 from markitdown import MarkItDown
 import pdfminer.high_level
 from tenacity import retry, stop_after_attempt, wait_exponential
+from cryptography.utils import CryptographyDeprecationWarning
 
 # Load environment variables and configure logging
 load_dotenv()
@@ -26,8 +28,19 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Suppress HTTP request logs
+logging.getLogger("openai").setLevel(logging.WARNING)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+
+# Configure OpenAI client for DeepSeek
+client = openai.OpenAI(
+    api_key=os.getenv('DEEPSEEK_API_KEY'),
+    base_url="https://api.deepseek.com/v1"  # Using v1 endpoint for stability
+)
+
 # Suppress warnings
 warnings.filterwarnings("ignore", category=RuntimeWarning)
+warnings.filterwarnings("ignore", category=CryptographyDeprecationWarning)
 
 # Text processing utilities
 def clean_text(text):
@@ -48,43 +61,31 @@ def clean_filename(filename):
     cleaned = cleaned.replace(' ', '_')
     return cleaned[:255]
 
-def extract_title_with_xai(pdf_path, xai_api_key):
-    """Extract paper title using xAI"""
+def extract_title_from_text(cleaned_text, fallback_name):
+    """Extract paper title from cleaned text using DeepSeek"""
     try:
-        # Extract first page text for title extraction
-        with open(pdf_path, 'rb') as file:
-            reader = pypdf.PdfReader(file)
-            first_page_text = reader.pages[0].extract_text()
-        
-        # Prepare xAI API request
-        response = requests.post(
-            "https://api.x.ai/v1/chat/completions",
-            headers={
-                "Authorization": f"Bearer {xai_api_key}",
-                "Content-Type": "application/json"
-            },
-            json={
-                "model": "grok-beta",
-                "messages": [
-                    {
-                        "role": "system",
-                        "content": "Extract the title of the academic paper from the given text. Return only the title, without any additional text."
-                    },
-                    {
-                        "role": "user", 
-                        "content": first_page_text[:1000]
-                    }
-                ],
-                "max_tokens": 50
-            }
+        response = client.chat.completions.create(
+            model="deepseek-chat",
+            messages=[
+                {
+                    "role": "system",
+                    "content": "You are a precise academic paper title extractor. Extract only the main title from the text, without any additional content. The text is already cleaned and formatted."
+                },
+                {
+                    "role": "user",
+                    "content": cleaned_text[:1000]  # Use first 1000 chars of cleaned text
+                }
+            ],
+            max_tokens=50,
+            temperature=0.1
         )
         
-        response_data = response.json()
-        extracted_title = response_data['choices'][0]['message']['content'].strip()
-        return extracted_title if extracted_title else pdf_path.stem
+        extracted_title = response.choices[0].message.content.strip() if response.choices[0].message.content else ""
+        return extracted_title if extracted_title else fallback_name
     
-    except Exception:
-        return pdf_path.stem
+    except Exception as e:
+        logger.error(f"Title extraction failed: {e}")
+        return fallback_name
 
 def fallback_pdf_extraction(pdf_path):
     """Fallback text extraction method using pypdf"""
@@ -97,79 +98,83 @@ def fallback_pdf_extraction(pdf_path):
         logger.error(f"Fallback extraction failed for {pdf_path}: {e}")
         return ""
 
-def clean_text_with_xai(text, xai_api_key):
-    """
-    Use xAI to clean and structure the extracted text.
-    Replaces basic text cleaning with AI-powered cleaning.
-    Args:
-        text: Raw text content
-        xai_api_key: xAI API key
-    Returns:
-        Cleaned and structured text
-    """
+def clean_text_with_deepseek(text):
+    """Use DeepSeek to clean and structure the extracted text with context caching"""
     try:
-        if not xai_api_key:
-            logger.warning("xAI API key not found. Falling back to basic cleaning.")
-            return clean_text(text)
-
         @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=10))
-        def call_xai_api(content):
-            response = requests.post(
-                "https://api.x.ai/v1/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {xai_api_key}",
-                    "Content-Type": "application/json"
-                },
-                json={
-                    "model": "grok-beta",
-                    "messages": [
-                        {
-                            "role": "system",
-                            "content": """
-                            Clean and structure the academic text with these requirements:
-                            1. Fix OCR errors and encoding issues
-                            2. Remove invalid Unicode characters while preserving valid ones
-                            3. Maintain proper paragraph structure and indentation
-                            4. Keep all mathematical symbols, equations, and special characters
-                            5. Preserve citations and references
-                            6. Remove redundant whitespace and control characters
-                            7. Ensure consistent line endings
-                            8. Handle multi-language text appropriately
-                            Return only the cleaned text.
-                            """
-                        },
-                        {
-                            "role": "user",
-                            "content": content
-                        }
-                    ],
-                    "max_tokens": 4000,
-                    "temperature": 0.1  # Low temperature for consistent cleaning
-                }
+        def call_deepseek_api(content, is_continuation=False):
+            system_prompt = """You are a text cleaner that preserves markdown formatting. Your task is to clean and structure academic text while maintaining all markdown syntax.
+                Output ONLY the cleaned text without any explanations.
+                Requirements:
+                1. Preserve all markdown syntax including:
+                   - Headers (#, ##, ###)
+                   - Lists (* or -, numbered lists)
+                   - Code blocks (```)
+                   - Tables
+                   - Bold and italic markers (* or _)
+                   - Links and images
+                2. Fix OCR errors and encoding issues
+                3. Maintain proper paragraph structure
+                4. Keep all mathematical symbols and equations
+                5. Preserve citations and references
+                6. Remove redundant whitespace
+                7. Ensure consistent line endings"""
+            
+            if is_continuation:
+                system_prompt = "Continue cleaning the text while preserving all markdown formatting. Output ONLY the cleaned text without any explanations."
+
+            response = client.chat.completions.create(
+                model="deepseek-chat",
+                messages=[
+                    {
+                        "role": "system",
+                        "content": system_prompt
+                    },
+                    {
+                        "role": "user",
+                        "content": content
+                    }
+                ],
+                max_tokens=4000,
+                temperature=0.1
             )
             
-            response_data = response.json()
-            return response_data['choices'][0]['message']['content'].strip()
+            # Update the usage logging to use standard OpenAI response attributes
+            usage = response.usage
+            if usage:
+                logger.info(f"Total tokens used: {usage.total_tokens}")
+                logger.info(f"Prompt tokens: {usage.prompt_tokens}")
+                logger.info(f"Completion tokens: {usage.completion_tokens}")
+            
+            return response.choices[0].message.content.strip() if response.choices[0].message.content else ""
 
-        # Process text in chunks
-        max_chunk = 8000
+        # Process text in chunks optimized for DeepSeek's context window
+        max_chunk = 12000  # Optimized for DeepSeek's 64K context window
         if len(text) > max_chunk:
             chunks = [text[i:i + max_chunk] for i in range(0, len(text), max_chunk)]
             cleaned_chunks = []
+            
+            # Process chunks with context caching awareness
             for i, chunk in enumerate(chunks):
-                logger.info(f"Cleaning chunk {i+1}/{len(chunks)} with xAI...")
-                cleaned_chunks.append(call_xai_api(chunk))
+                logger.info(f"Cleaning chunk {i+1}/{len(chunks)} with DeepSeek...")
+                if i == 0:
+                    cleaned_chunks.append(call_deepseek_api(chunk))
+                else:
+                    # Use prefix from previous chunk to maintain context and leverage caching
+                    overlap = 200
+                    context = cleaned_chunks[-1][-overlap:] if cleaned_chunks else ""
+                    cleaned_chunks.append(call_deepseek_api(context + chunk, is_continuation=True))
+            
             return "\n\n".join(cleaned_chunks)
         else:
-            return call_xai_api(text)
+            return call_deepseek_api(text)
 
     except Exception as e:
-        logger.error(f"xAI cleaning failed: {e}. Falling back to basic cleaning.")
+        logger.error(f"DeepSeek cleaning failed: {e}. Falling back to basic cleaning.")
         return clean_text(text)
 
 def convert_pdfs_to_md(input_dir: str, output_dir: str, compress_md: bool = False):
-    """Convert PDF files to Markdown, with xAI cleaning and optional compression"""
-    xai_key = os.getenv('XAI_API_KEY')
+    """Convert PDF files to Markdown, with DeepSeek cleaning and optional compression"""
     markitdown = MarkItDown()
     
     os.makedirs(output_dir, exist_ok=True)
@@ -184,20 +189,6 @@ def convert_pdfs_to_md(input_dir: str, output_dir: str, compress_md: bool = Fals
     skipped_files = 0
     
     for pdf_path in pdf_files:
-        if xai_key:
-            try:
-                paper_title = extract_title_with_xai(pdf_path, xai_key)
-                output_file = Path(output_dir) / f"{clean_filename(paper_title)}.md"
-            except Exception:
-                output_file = Path(output_dir) / f"{pdf_path.stem}.md"
-        else:
-            output_file = Path(output_dir) / f"{pdf_path.stem}.md"
-        
-        if output_file.exists():
-            logger.info(f"✓ {pdf_path.name} already converted (skipping)")
-            skipped_files += 1
-            continue
-            
         try:
             text_content = ""
             conversion_methods = [
@@ -219,7 +210,16 @@ def convert_pdfs_to_md(input_dir: str, output_dir: str, compress_md: bool = Fals
                 skipped_files += 1
                 continue
             
-            cleaned_text = clean_text_with_xai(text_content, xai_key)
+            cleaned_text = clean_text_with_deepseek(text_content)
+            
+            # Extract title from cleaned text
+            paper_title = extract_title_from_text(cleaned_text, pdf_path.stem)
+            output_file = Path(output_dir) / f"{clean_filename(paper_title)}.md"
+            
+            if output_file.exists():
+                logger.info(f"✓ {pdf_path.name} already converted (skipping)")
+                skipped_files += 1
+                continue
             
             with open(output_file, 'w', encoding='utf-8') as f:
                 f.write(cleaned_text)
