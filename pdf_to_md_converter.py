@@ -1,6 +1,5 @@
 import os
 import re
-import time
 import logging
 import warnings
 import argparse
@@ -8,16 +7,11 @@ import unicodedata
 from pathlib import Path
 
 # Third-party imports
-import spacy
 import pypdf
 import requests
-import camelot.io as camelot
-from tqdm import tqdm
 from dotenv import load_dotenv
 from markitdown import MarkItDown
 import pdfminer.high_level
-from pdfminer.layout import LAParams, LTTextContainer
-from pdfminer.high_level import extract_pages
 
 # Load environment variables and configure logging
 load_dotenv()
@@ -102,107 +96,59 @@ def fallback_pdf_extraction(pdf_path):
         logger.error(f"Fallback extraction failed for {pdf_path}: {e}")
         return ""
 
-# PDF extraction functions
-def extract_text_with_layout(pdf_path):
-    """Extract text while preserving layout and formatting"""
-    text_content = []
-    for page_layout in extract_pages(pdf_path, laparams=LAParams()):
-        for element in page_layout:
-            if isinstance(element, LTTextContainer):
-                text_content.append(element.get_text())
-    return '\n'.join(text_content)
 
-def extract_tables(pdf_path):
-    """Extract tables from PDF using Camelot"""
-    tables = camelot.read_pdf(pdf_path)
-    markdown_tables = []
-    for table in tables:
-        markdown = "| " + " | ".join(table.df.columns) + " |\n"
-        markdown += "| " + " | ".join(["---"] * len(table.df.columns)) + " |\n"
-        for _, row in table.df.iterrows():
-            markdown += "| " + " | ".join(row) + " |\n"
-        markdown_tables.append(markdown)
-    return markdown_tables
-
-def extract_math_formulas(text):
-    """Extract mathematical formulas using regex patterns"""
-    formula_patterns = [
-        r'\$(.*?)\$',  # Inline math
-        r'\[\[(.*?)\]\]',  # Display math
-    ]
-    formulas = []
-    for pattern in formula_patterns:
-        matches = re.finditer(pattern, text)
-        for match in matches:
-            formulas.append(match.group(1))
-    return formulas
-
-# NLP functions
-def detect_sections(text):
-    """Improved section detection using NLP"""
-    nlp = spacy.load("en_core_web_sm")
-    section_headers = {
-        'abstract': ['abstract', 'summary'],
-        'introduction': ['introduction', 'background'],
-        'methodology': ['methodology', 'methods', 'approach'],
-        'results': ['results', 'findings', 'evaluation'],
-        'conclusion': ['conclusion', 'conclusions', 'future work'],
-        'references': ['references', 'bibliography']
-    }
-    doc = nlp(text)
-    sections = {}
-    for section, keywords in section_headers.items():
-        for sent in doc.sents:
-            if any(keyword in sent.text.lower() for keyword in keywords):
-                sections[section] = sent.start_char
-    return sections
-
-# Conversion functions
-def convert_pdf(pdf_path):
-    """Convert a single PDF file to markdown format"""
-    try:
-        text_content = extract_text_with_layout(pdf_path)
-        sections = detect_sections(text_content)
-        tables = extract_tables(pdf_path)
-        formulas = extract_math_formulas(text_content)
+def compress_markdown(text):
+    """
+    Compress markdown content while preserving essential formatting.
+    """
+    # Split into lines and process
+    lines = text.split('\n')
+    compressed_lines = []
+    in_code_block = False
+    prev_line_empty = False
+    
+    for line in lines:
+        # Preserve code blocks
+        if line.startswith('```'):
+            in_code_block = not in_code_block
+            compressed_lines.append(line)
+            continue
         
-        markdown_content = text_content
+        if in_code_block:
+            compressed_lines.append(line)
+            continue
+            
+        # Clean the line
+        line = line.strip()
         
-        if tables:
-            markdown_content += "\n\n## Tables\n\n" + "\n\n".join(tables)
-        if formulas:
-            markdown_content += "\n\n## Mathematical Formulas\n\n"
-            for formula in formulas:
-                markdown_content += f"\n${formula}$\n"
+        # Skip if empty line and we already have one
+        if not line:
+            if not prev_line_empty:
+                compressed_lines.append('')
+                prev_line_empty = True
+            continue
         
-        return markdown_content
-    except Exception as e:
-        logger.error(f"Error converting {pdf_path}: {e}")
-        raise
+        prev_line_empty = False
+        
+        # Compress multiple spaces
+        line = re.sub(r'\s+', ' ', line)
+        
+        # Remove spaces around formatting characters
+        line = re.sub(r'\s*(\*\*|__|\*|_|~~|\|)\s*', r'\1', line)
+        
+        # Clean up links
+        line = re.sub(r'\[\s+(.+?)\s+\]\(\s*(.+?)\s*\)', r'[\1](\2)', line)
+        
+        compressed_lines.append(line)
+    
+    # Join lines and clean up multiple newlines
+    text = '\n'.join(compressed_lines)
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    
+    return text
 
-def safe_convert(pdf_path, retries=3):
-    """Conversion with error recovery"""
-    for attempt in range(retries):
-        try:
-            return convert_pdf(pdf_path)
-        except Exception as e:
-            if attempt == retries - 1:
-                logger.error(f"Failed to convert {pdf_path} after {retries} attempts: {e}")
-                raise
-            logger.warning(f"Attempt {attempt + 1} failed, retrying...")
-            time.sleep(1)
-
-def convert_batch(pdf_files):
-    """Convert multiple PDFs with progress bar"""
-    results = []
-    with tqdm(total=len(pdf_files), desc="Converting PDFs") as pbar:
-        for pdf in pdf_files:
-            results.append(convert_pdf(pdf))
-            pbar.update(1)
-    return results
-
-def convert_pdfs_to_md(input_dir: str, output_dir: str):
-    """Convert PDF files to Markdown, skipping already converted files"""
+def convert_pdfs_to_md(input_dir: str, output_dir: str, compress_md: bool = False):
+    """Convert PDF files to Markdown, with optional markdown compression"""
     xai_key = os.getenv('XAI_API_KEY')
     markitdown = MarkItDown()
     
@@ -254,8 +200,18 @@ def convert_pdfs_to_md(input_dir: str, output_dir: str):
                 continue
             
             cleaned_text = clean_text(text_content)
+            
+            if compress_md:
+                cleaned_text = compress_markdown(cleaned_text)
+            
             with open(output_file, 'w', encoding='utf-8') as f:
                 f.write(cleaned_text)
+            
+            if compress_md:
+                original_size = len(text_content.encode('utf-8'))
+                compressed_size = len(cleaned_text.encode('utf-8'))
+                reduction = (original_size - compressed_size) / original_size * 100
+                logger.info(f"Markdown compression: {reduction:.1f}% reduction")
             
             logger.info(f"✓ {pdf_path.name} → {output_file.name}")
             converted_files += 1
@@ -272,9 +228,11 @@ def main():
     parser = argparse.ArgumentParser(description='PDF to Markdown Converter')
     parser.add_argument('input_dir', help='Input PDF directory')
     parser.add_argument('output_dir', help='Output Markdown directory')
+    parser.add_argument('--compress-md', action='store_true', 
+                       help='Compress markdown output (reduces file size but maintains readability)')
     
     args = parser.parse_args()
-    convert_pdfs_to_md(args.input_dir, args.output_dir)
+    convert_pdfs_to_md(args.input_dir, args.output_dir, compress_md=args.compress_md)
 
 if __name__ == '__main__':
     main()
