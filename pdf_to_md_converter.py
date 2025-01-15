@@ -12,6 +12,7 @@ import requests
 from dotenv import load_dotenv
 from markitdown import MarkItDown
 import pdfminer.high_level
+from tenacity import retry, stop_after_attempt, wait_exponential
 
 # Load environment variables and configure logging
 load_dotenv()
@@ -96,59 +97,78 @@ def fallback_pdf_extraction(pdf_path):
         logger.error(f"Fallback extraction failed for {pdf_path}: {e}")
         return ""
 
+def clean_text_with_xai(text, xai_api_key):
+    """
+    Use xAI to clean and structure the extracted text.
+    Replaces basic text cleaning with AI-powered cleaning.
+    Args:
+        text: Raw text content
+        xai_api_key: xAI API key
+    Returns:
+        Cleaned and structured text
+    """
+    try:
+        if not xai_api_key:
+            logger.warning("xAI API key not found. Falling back to basic cleaning.")
+            return clean_text(text)
 
-def compress_markdown(text):
-    """
-    Compress markdown content while preserving essential formatting.
-    """
-    # Split into lines and process
-    lines = text.split('\n')
-    compressed_lines = []
-    in_code_block = False
-    prev_line_empty = False
-    
-    for line in lines:
-        # Preserve code blocks
-        if line.startswith('```'):
-            in_code_block = not in_code_block
-            compressed_lines.append(line)
-            continue
-        
-        if in_code_block:
-            compressed_lines.append(line)
-            continue
+        @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=10))
+        def call_xai_api(content):
+            response = requests.post(
+                "https://api.x.ai/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {xai_api_key}",
+                    "Content-Type": "application/json"
+                },
+                json={
+                    "model": "grok-beta",
+                    "messages": [
+                        {
+                            "role": "system",
+                            "content": """
+                            Clean and structure the academic text with these requirements:
+                            1. Fix OCR errors and encoding issues
+                            2. Remove invalid Unicode characters while preserving valid ones
+                            3. Maintain proper paragraph structure and indentation
+                            4. Keep all mathematical symbols, equations, and special characters
+                            5. Preserve citations and references
+                            6. Remove redundant whitespace and control characters
+                            7. Ensure consistent line endings
+                            8. Handle multi-language text appropriately
+                            Return only the cleaned text.
+                            """
+                        },
+                        {
+                            "role": "user",
+                            "content": content
+                        }
+                    ],
+                    "max_tokens": 4000,
+                    "temperature": 0.1  # Low temperature for consistent cleaning
+                }
+            )
             
-        # Clean the line
-        line = line.strip()
-        
-        # Skip if empty line and we already have one
-        if not line:
-            if not prev_line_empty:
-                compressed_lines.append('')
-                prev_line_empty = True
-            continue
-        
-        prev_line_empty = False
-        
-        # Compress multiple spaces
-        line = re.sub(r'\s+', ' ', line)
-        
-        # Remove spaces around formatting characters
-        line = re.sub(r'\s*(\*\*|__|\*|_|~~|\|)\s*', r'\1', line)
-        
-        # Clean up links
-        line = re.sub(r'\[\s+(.+?)\s+\]\(\s*(.+?)\s*\)', r'[\1](\2)', line)
-        
-        compressed_lines.append(line)
-    
-    # Join lines and clean up multiple newlines
-    text = '\n'.join(compressed_lines)
-    text = re.sub(r'\n{3,}', '\n\n', text)
-    
-    return text
+            response_data = response.json()
+            return response_data['choices'][0]['message']['content'].strip()
+
+        # Process text in chunks
+        max_chunk = 8000
+        if len(text) > max_chunk:
+            chunks = [text[i:i + max_chunk] for i in range(0, len(text), max_chunk)]
+            cleaned_chunks = []
+            for i, chunk in enumerate(chunks):
+                logger.info(f"Cleaning chunk {i+1}/{len(chunks)} with xAI...")
+                cleaned_chunks.append(call_xai_api(chunk))
+            return "\n\n".join(cleaned_chunks)
+        else:
+            return call_xai_api(text)
+
+    except Exception as e:
+        logger.error(f"xAI cleaning failed: {e}. Falling back to basic cleaning.")
+        return clean_text(text)
 
 def convert_pdfs_to_md(input_dir: str, output_dir: str, compress_md: bool = False):
-    """Convert PDF files to Markdown, with optional markdown compression"""
+    """Convert PDF files to Markdown, with xAI cleaning and optional compression"""
     xai_key = os.getenv('XAI_API_KEY')
     markitdown = MarkItDown()
     
@@ -199,10 +219,7 @@ def convert_pdfs_to_md(input_dir: str, output_dir: str, compress_md: bool = Fals
                 skipped_files += 1
                 continue
             
-            cleaned_text = clean_text(text_content)
-            
-            if compress_md:
-                cleaned_text = compress_markdown(cleaned_text)
+            cleaned_text = clean_text_with_xai(text_content, xai_key)
             
             with open(output_file, 'w', encoding='utf-8') as f:
                 f.write(cleaned_text)
@@ -228,11 +245,8 @@ def main():
     parser = argparse.ArgumentParser(description='PDF to Markdown Converter')
     parser.add_argument('input_dir', help='Input PDF directory')
     parser.add_argument('output_dir', help='Output Markdown directory')
-    parser.add_argument('--compress-md', action='store_true', 
-                       help='Compress markdown output (reduces file size but maintains readability)')
-    
     args = parser.parse_args()
-    convert_pdfs_to_md(args.input_dir, args.output_dir, compress_md=args.compress_md)
+    convert_pdfs_to_md(args.input_dir, args.output_dir)
 
 if __name__ == '__main__':
     main()

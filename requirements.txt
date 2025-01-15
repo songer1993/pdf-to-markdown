@@ -14,3 +14,4 @@ ghostscript>=0.7
 # Additional Dependencies
 spacy
 tqdm
+tenacity>=8.0.0
