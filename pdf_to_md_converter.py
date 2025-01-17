@@ -1,46 +1,31 @@
+# Standard library imports
 import os
 import re
+import sys
+import time
+import queue
+import signal
 import logging
 import warnings
 import argparse
-import unicodedata
-import signal
-from pathlib import Path
-from concurrent.futures import ThreadPoolExecutor, as_completed
-import sys  # Add this import
 import threading
-import queue
-import time
+import unicodedata
+from pathlib import Path
 from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # Third-party imports
 import pypdf
+import openai
 import requests
-import openai  # Changed to use OpenAI's SDK for DeepSeek compatibility
+from tqdm import tqdm
 from dotenv import load_dotenv
 from markitdown import MarkItDown
 import pdfminer.high_level
 from tenacity import retry, stop_after_attempt, wait_exponential
 from cryptography.utils import CryptographyDeprecationWarning
-from tqdm import tqdm
 
-# Load environment variables and configure logging
-load_dotenv()
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(message)s',
-    handlers=[
-        logging.FileHandler('pdf_conversion.log'),
-        logging.StreamHandler()
-    ]
-)
-logger = logging.getLogger(__name__)
-
-# Suppress HTTP request logs
-logging.getLogger("openai").setLevel(logging.WARNING)
-logging.getLogger("httpx").setLevel(logging.WARNING)
-
-# Constants section - group related constants
+# Constants
 API_CONFIG = {
     'deepseek': {
         'model': 'deepseek-chat',
@@ -63,12 +48,12 @@ FILE_PROCESSING = {
     'overlap_size': 200
 }
 
-# System prompts as constants
-TITLE_EXTRACTION_PROMPT = """You are a precise academic paper title extractor. 
+PROMPTS = {
+    'title_extraction': """You are a precise academic paper title extractor. 
 Extract only the main title from the text, without any additional content. 
-The text is already cleaned and formatted."""
+The text is already cleaned and formatted.""",
 
-TEXT_CLEANING_PROMPT = """You are a text cleaner specialized in academic papers. Clean and structure the text while:
+    'text_cleaning': """You are a text cleaner specialized in academic papers. Clean and structure the text while:
 
 1. KEEP:
    - Main title
@@ -102,13 +87,49 @@ TEXT_CLEANING_PROMPT = """You are a text cleaner specialized in academic papers.
    - Clean up OCR errors
    - Remove duplicate whitespace
 
-Output ONLY the cleaned text without explanations."""
+Output ONLY the cleaned text without explanations.""",
 
-CONTINUATION_PROMPT = """Continue cleaning the text while preserving all markdown formatting. 
-Output ONLY the cleaned text without any explanations."""
+    'continuation': """Continue cleaning the text while preserving all markdown formatting. 
+Output ONLY the cleaned text without any explanations.""",
 
-# Global flag for graceful interruption
-interrupted = False
+    'classification': """You are a document classifier. Classify academic documents as one of:
+- journal_paper
+- conference_paper
+- book_chapter
+- thesis
+- technical_report
+- preprint
+- unknown
+
+Return only the classification label, nothing else."""
+}
+
+# Global state management
+class State:
+    """Manages global application state"""
+    def __init__(self):
+        self.interrupted = False
+        self.client: openai.OpenAI | None = None
+
+state = State()
+
+# Configure logging
+load_dotenv()
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(message)s',
+    handlers=[
+        logging.FileHandler('pdf_conversion.log'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
+# Suppress warnings and logs
+logging.getLogger("openai").setLevel(logging.WARNING)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+warnings.filterwarnings("ignore", category=RuntimeWarning)
+warnings.filterwarnings("ignore", category=CryptographyDeprecationWarning)
 
 # Move API client configuration to a separate function
 def configure_api_client(provider='deepseek'):
@@ -129,20 +150,13 @@ def configure_api_client(provider='deepseek'):
         )
     else:
         raise ValueError(f"Unsupported API provider: {provider}")
-
-# After the constants section, initialize the OpenAI client
-client = configure_api_client()
-
-# Suppress warnings (add back after constants)
-warnings.filterwarnings("ignore", category=RuntimeWarning)
-warnings.filterwarnings("ignore", category=CryptographyDeprecationWarning)
+        return None
 
 def signal_handler(signum, frame):
     """Handle interrupt signal"""
-    global interrupted
-    if not interrupted:
+    if not state.interrupted:
         logger.info("\nGracefully shutting down... (Press Ctrl+C again to force quit)")
-        interrupted = True
+        state.interrupted = True
     else:
         logger.info("\nForce quitting...")
         sys.exit(1)
@@ -219,18 +233,20 @@ def make_api_call(messages, filename, provider='deepseek'):
         config = API_CONFIG[provider]
         
         if provider == 'xai':
-            # Format messages for XAI's Grok model
             formatted_messages = [
                 {
                     "role": m["role"],
-                    "content": m["content"].replace("\n\n", "\n").strip()  # XAI prefers concise prompts
+                    "content": m["content"].replace("\n\n", "\n").strip()
                 }
                 for m in messages
             ]
         else:
             formatted_messages = messages
 
-        response = client.chat.completions.create(
+        if not state.client:
+            raise ValueError("API client not configured")
+        
+        response = state.client.chat.completions.create(
             model=config['model'],
             messages=[{"role": m["role"], "content": m["content"]} for m in formatted_messages],
             max_tokens=config['max_tokens'],
@@ -249,11 +265,11 @@ def make_api_call(messages, filename, provider='deepseek'):
         return "", 0
 
 def extract_title_from_text(cleaned_text, fallback_name, provider='deepseek'):
-    """Extract paper title from cleaned text using DeepSeek"""
+    """Extract paper title from cleaned text using AI"""
     messages = [
         {
             "role": "system",
-            "content": TITLE_EXTRACTION_PROMPT
+            "content": PROMPTS['title_extraction']
         },
         {
             "role": "user",
@@ -274,7 +290,7 @@ def clean_text_with_ai(text, filename, provider='deepseek'):
         messages = [
             {
                 "role": "system",
-                "content": CONTINUATION_PROMPT if is_continuation else TEXT_CLEANING_PROMPT
+                "content": PROMPTS['continuation'] if is_continuation else PROMPTS['text_cleaning']
             },
             {
                 "role": "user",
@@ -302,7 +318,7 @@ def clean_text_with_ai(text, filename, provider='deepseek'):
             
             logger.info(f"[{filename}] Processing {len(chunks)} chunks...")
             for i, chunk in enumerate(chunks, 1):
-                if interrupted:
+                if state.interrupted:
                     return clean_text(text), total_tokens
                 
                 context = (cleaned_chunks[-1][-FILE_PROCESSING['overlap_size']:] 
@@ -326,7 +342,7 @@ def clean_text_with_ai(text, filename, provider='deepseek'):
 # Improve PDF processing with better error handling
 def process_pdf(pdf_path, output_dir, provider='deepseek'):
     """Process a single PDF file"""
-    if interrupted:
+    if state.interrupted:
         return False
         
     filename = pdf_path.name
@@ -352,14 +368,14 @@ def process_pdf(pdf_path, output_dir, provider='deepseek'):
         logger.info(f"[{filename}] Cleaning text...")
         cleaned_text, cleaning_tokens = clean_text_with_ai(text_content, filename, provider)
         
-        if interrupted:
+        if state.interrupted:
             return False
             
         logger.info(f"[{filename}] Extracting title...")
         paper_title, title_tokens = extract_title_from_text(cleaned_text, pdf_path.stem, provider)
         
         # Save the markdown
-        save_optimized_markdown(cleaned_text, output_dir, paper_title)
+        save_optimized_markdown(cleaned_text, output_dir, paper_title, provider)
         
         logger.info(
             f"[{filename}] Converted → {clean_filename(paper_title)}.md "
@@ -378,15 +394,13 @@ class PDFProcessor:
         self.queue = queue.Queue()
         self.stats = {'converted': 0, 'skipped': 0}
         self.lock = threading.Lock()
-        self.interrupted = False
 
     def process_queue(self):
         while True:
             try:
-                if self.interrupted:
+                if state.interrupted:
                     break
                     
-                # Unpack all three values from queue
                 pdf_path, output_dir, provider = self.queue.get_nowait()
                 success = process_pdf(pdf_path, output_dir, provider)
                 
@@ -406,8 +420,12 @@ class PDFProcessor:
 
 def convert_pdfs_to_md(input_dir: str, output_dir: str, provider: str = 'deepseek'):
     """Convert PDFs to Markdown with specified AI provider"""
-    global client
     client = configure_api_client(provider)
+    if not client:
+        logger.error(f"Failed to configure API client for {provider}")
+        return
+    
+    state.client = client
     
     os.makedirs(output_dir, exist_ok=True)
     pdf_files = list(Path(input_dir).glob('*.pdf'))
@@ -434,13 +452,12 @@ def convert_pdfs_to_md(input_dir: str, output_dir: str, provider: str = 'deepsee
     try:
         # Wait for all tasks to complete or interruption
         while any(thread.is_alive() for thread in workers):
-            if interrupted:
-                processor.interrupted = True
+            if state.interrupted:
                 break
             time.sleep(0.1)
 
     except KeyboardInterrupt:
-        processor.interrupted = True
+        state.interrupted = True
         logger.info("\nOperation interrupted by user")
 
     finally:
@@ -483,35 +500,93 @@ def optimize_for_llm_context(text, max_chunk_size=8000):
     return chunks
 
 
-def save_optimized_markdown(text, output_dir, title):
-    """Save markdown in LLM-optimized chunks with search optimization"""
+def save_optimized_markdown(text, output_dir, title, provider='deepseek'):
+    """Save markdown in LLM-optimized chunks"""
     chunks = optimize_for_llm_context(text)
-    paper_dir = Path(output_dir) / clean_filename(title)
-    paper_dir.mkdir(exist_ok=True)
+    output_dir = Path(output_dir)
+    safe_title = clean_filename(title)
     
-    # Create a single full content file for search indexing
-    full_content_file = paper_dir / f"{clean_filename(title)}_full.md"
-    full_content = add_frontmatter(text, title)
-    full_content_file.write_text(full_content, encoding='utf-8')
+    # Detect paper type once for consistency
+    paper_type = detect_paper_type(text, title, 'untitled', provider)
     
-    # Create chunked files for LLM processing
-    if len(chunks) > 1:
+    if len(chunks) == 1:
+        # Single file if content fits context window
+        content = add_frontmatter(chunks[0], title, paper_type=paper_type)
+        (output_dir / f"{safe_title}.md").write_text(content, encoding='utf-8')
+    else:
+        # Create directory for split content
+        paper_dir = output_dir / safe_title
+        paper_dir.mkdir(exist_ok=True)
+        
+        # Create index file
+        index_content = add_frontmatter(
+            f"# {title}\n\n## Contents\n\n",
+            title,
+            paper_type=paper_type,
+            is_index=True
+        )
+        
+        # Save chunks with proper linking
         for i, chunk in enumerate(chunks, 1):
-            chunk_file = paper_dir / f"{clean_filename(title)}_part_{i:02d}.md"
-            chunk_content = add_frontmatter(chunk, f"{title} - Part {i}", i)
-            chunk_file.write_text(chunk_content, encoding='utf-8')
+            chunk_file = f"part_{i:02d}.md"
+            # Add frontmatter to each chunk with part number
+            content = add_frontmatter(
+                chunk,
+                title,
+                chunk_number=i,
+                paper_type=paper_type
+            )
+            (paper_dir / chunk_file).write_text(content, encoding='utf-8')
+            index_content += f"- [Part {i}]({chunk_file})\n"
+        
+        # Save index
+        (paper_dir / "index.md").write_text(index_content, encoding='utf-8')
 
-def add_frontmatter(text, title, chunk_number=None):
-    """Add YAML frontmatter for better indexing"""
-    frontmatter = f"""---
-title: {title}
-date: {datetime.now().strftime('%Y-%m-%d')}
-type: academic_paper
-{f'part: {chunk_number}' if chunk_number else ''}
----
+def add_frontmatter(text, title, chunk_number=None, paper_type=None, is_index=False):
+    """Add YAML frontmatter for better indexing
+    
+    Args:
+        text: The document text
+        title: Document title
+        chunk_number: Part number for multi-part documents
+        paper_type: Type of academic document
+        is_index: Whether this is an index file
+    """
+    frontmatter = [
+        "---",
+        f"title: {title}",
+        f"type: {paper_type or 'unknown'}"
+    ]
+    
+    if is_index:
+        frontmatter.extend([
+            "part: index"
+        ])
+    else:
+        frontmatter.extend([
+            f"part: {chunk_number if chunk_number else 'index'}"
+        ])
+    
+    frontmatter.append("---\n")
+    return "\n".join(frontmatter) + text
 
-"""
-    return frontmatter + text
+def detect_paper_type(text, title, filename, provider='deepseek'):
+    """Use LLM to detect academic document type"""
+    sample = text[:1000]
+    
+    messages = [
+        {
+            "role": "system",
+            "content": PROMPTS['classification']
+        },
+        {
+            "role": "user",
+            "content": f"Title: {title}\n\nExcerpt:\n{sample}"
+        }
+    ]
+    
+    result, _ = make_api_call(messages, filename, provider)
+    return result.lower().strip() or 'unknown'
 
 # Main entry point
 def main():
