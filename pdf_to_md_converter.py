@@ -11,6 +11,7 @@ import sys  # Add this import
 import threading
 import queue
 import time
+from datetime import datetime
 
 # Third-party imports
 import pypdf
@@ -357,15 +358,11 @@ def process_pdf(pdf_path, output_dir, provider='deepseek'):
         logger.info(f"[{filename}] Extracting title...")
         paper_title, title_tokens = extract_title_from_text(cleaned_text, pdf_path.stem, provider)
         
-        output_file = Path(output_dir) / f"{clean_filename(paper_title)}.md"
-        if output_file.exists():
-            logger.info(f"[{filename}] Skipping - Output file already exists")
-            return False
-        
-        output_file.write_text(cleaned_text, encoding='utf-8')
+        # Save the markdown
+        save_optimized_markdown(cleaned_text, output_dir, paper_title)
         
         logger.info(
-            f"[{filename}] Converted → {output_file.name} "
+            f"[{filename}] Converted → {clean_filename(paper_title)}.md "
             f"(Tokens: {cleaning_tokens + title_tokens:,})"
         )
         return True
@@ -407,7 +404,6 @@ class PDFProcessor:
                 logger.error(f"Worker error: {e}")
                 break
 
-# Update the convert_pdfs_to_md function
 def convert_pdfs_to_md(input_dir: str, output_dir: str, provider: str = 'deepseek'):
     """Convert PDFs to Markdown with specified AI provider"""
     global client
@@ -456,6 +452,66 @@ def convert_pdfs_to_md(input_dir: str, output_dir: str, provider: str = 'deepsee
         logger.info(f"Total files: {len(pdf_files)}")
         logger.info(f"Converted: {processor.stats['converted']}")
         logger.info(f"Skipped: {processor.stats['skipped']}")
+
+def optimize_for_llm_context(text, max_chunk_size=8000):
+    """Split text into LLM-friendly chunks while preserving structure"""
+    # Preserve markdown headers as chunk boundaries
+    chunks = []
+    current_chunk = []
+    current_size = 0
+    
+    # Split by headers first
+    sections = re.split(r'(^#{1,6}\s.*$)', text, flags=re.MULTILINE)
+    
+    for section in sections:
+        section_size = len(section)
+        
+        if current_size + section_size > max_chunk_size:
+            # Save current chunk
+            if current_chunk:
+                chunks.append('\n'.join(current_chunk))
+            current_chunk = [section]
+            current_size = section_size
+        else:
+            current_chunk.append(section)
+            current_size += section_size
+    
+    # Add remaining content
+    if current_chunk:
+        chunks.append('\n'.join(current_chunk))
+    
+    return chunks
+
+
+def save_optimized_markdown(text, output_dir, title):
+    """Save markdown in LLM-optimized chunks with search optimization"""
+    chunks = optimize_for_llm_context(text)
+    paper_dir = Path(output_dir) / clean_filename(title)
+    paper_dir.mkdir(exist_ok=True)
+    
+    # Create a single full content file for search indexing
+    full_content_file = paper_dir / f"{clean_filename(title)}_full.md"
+    full_content = add_frontmatter(text, title)
+    full_content_file.write_text(full_content, encoding='utf-8')
+    
+    # Create chunked files for LLM processing
+    if len(chunks) > 1:
+        for i, chunk in enumerate(chunks, 1):
+            chunk_file = paper_dir / f"{clean_filename(title)}_part_{i:02d}.md"
+            chunk_content = add_frontmatter(chunk, f"{title} - Part {i}", i)
+            chunk_file.write_text(chunk_content, encoding='utf-8')
+
+def add_frontmatter(text, title, chunk_number=None):
+    """Add YAML frontmatter for better indexing"""
+    frontmatter = f"""---
+title: {title}
+date: {datetime.now().strftime('%Y-%m-%d')}
+type: academic_paper
+{f'part: {chunk_number}' if chunk_number else ''}
+---
+
+"""
+    return frontmatter + text
 
 # Main entry point
 def main():
