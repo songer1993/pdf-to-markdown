@@ -11,14 +11,10 @@ import argparse
 import threading
 import unicodedata
 from pathlib import Path
-from datetime import datetime
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # Third-party imports
 import pypdf
 import openai
-import requests
-from tqdm import tqdm
 from dotenv import load_dotenv
 from markitdown import MarkItDown
 import pdfminer.high_level
@@ -29,20 +25,20 @@ from cryptography.utils import CryptographyDeprecationWarning
 API_CONFIG = {
     'deepseek': {
         'model': 'deepseek-chat',
-        'max_tokens': 4000,
+        'max_tokens': 8192,
         'temperature': 0.1,
-        'base_url': 'https://api.deepseek.com/v1'
+        'base_url': 'https://api.deepseek.com/beta'
     },
     'xai': {
         'model': 'grok-beta',
-        'max_tokens': 4000,
+        'max_tokens': 8192,
         'temperature': 0.1,
         'base_url': 'https://api.x.ai/v1'
     }
 }
 
 FILE_PROCESSING = {
-    'max_chunk_size': 12000,
+    'max_chunk_size': 24000,
     'max_filename_length': 255,
     'max_workers': 32,
     'overlap_size': 200
@@ -53,39 +49,58 @@ PROMPTS = {
 Extract only the main title from the text, without any additional content. 
 The text is already cleaned and formatted.""",
 
-    'text_cleaning': """You are a text cleaner specialized in academic papers. Clean and structure the text while:
+    'text_cleaning': """You are a text cleaner specialized in academic papers. Extract and structure only the main content while:
 
-1. KEEP:
-   - Main title
-   - Author names
-   - Abstract
-   - Section headings and content
-   - Key findings and conclusions
-   - Important figures and tables
-   - Essential equations and formulas
-   - Relevant citations in-text
+1. KEEP AND PROPERLY FORMAT:
+   - Main title (as # Title)
+   - Common main sections (always as ## level):
+     * Abstract
+     * Introduction
+     * Background
+     * Related Work
+     * Methodology
+     * Methods
+     * Materials and Methods
+     * Results
+     * Discussion
+     * Conclusion
+     * Future Work
+     * References
+   - Key equations and formulas
+   - Essential figures and tables (convert to markdown)
+   - In-text citations [1], [2], etc.
 
-2. REMOVE:
-   - Author affiliations and contact details
+2. STRICTLY REMOVE:
+   - Author names and affiliations
+   - Contact information
    - Headers and footers
    - Page numbers
-   - Copyright notices and journal information
-   - Acknowledgments section
-   - Funding statements
-   - Conference presentation details
-   - Declarations of interest
-   - Running headers/footers
+   - Copyright notices
+   - Journal information
+   - Acknowledgments and funding statements
+   - Grant information
+   - Image/figure credits or attributions
+   - Appendices
+   - Supplementary material
+   - Author contributions
+   - Conflict of interest statements
+   - Keywords and subject classifications
 
 3. FORMAT:
-   - Use markdown headers (#, ##, ###) for section titles
+   - Title as single # header
+   - Common main sections as ## headers
+   - Subsections as ### headers
+   - Format each reference on a new line, starting with the number
    - Use lists (* or -) for bullet points
-   - Use code blocks (```) ONLY for actual code snippets or algorithms
    - Keep tables in markdown format
-   - Use inline code (`) for short code references
    - Preserve mathematical notation
-   - Maintain logical paragraph breaks
-   - Clean up OCR errors
    - Remove duplicate whitespace
+   - Clean up OCR artifacts
+
+4. ENSURE:
+   - Title uses single # header
+   - All main sections use ## headers
+   - All subsections use ### headers
 
 Output ONLY the cleaned text without explanations.""",
 
@@ -471,27 +486,48 @@ def convert_pdfs_to_md(input_dir: str, output_dir: str, provider: str = 'deepsee
         logger.info(f"Skipped: {processor.stats['skipped']}")
 
 def optimize_for_llm_context(text, max_chunk_size=8000):
-    """Split text into LLM-friendly chunks while preserving structure"""
-    # Preserve markdown headers as chunk boundaries
+    """Split text into LLM-friendly chunks while preserving structure and meaning"""
     chunks = []
     current_chunk = []
     current_size = 0
     
-    # Split by headers first
-    sections = re.split(r'(^#{1,6}\s.*$)', text, flags=re.MULTILINE)
+    # Split by headers and preserve their hierarchy
+    lines = text.split('\n')
+    header_pattern = re.compile(r'^(#{1,6})\s+(.+)$')
     
-    for section in sections:
-        section_size = len(section)
+    def flush_chunk():
+        if current_chunk:
+            # Only create a chunk if it contains more than just a title
+            chunk_text = '\n'.join(current_chunk)
+            if len(current_chunk) > 1 or not header_pattern.match(chunk_text):
+                chunks.append(chunk_text)
+            current_chunk.clear()
+            return 0
+        return current_size
+    
+    current_section = None
+    for line in lines:
+        line_size = len(line) + 1  # +1 for newline
+        header_match = header_pattern.match(line)
         
-        if current_size + section_size > max_chunk_size:
-            # Save current chunk
-            if current_chunk:
-                chunks.append('\n'.join(current_chunk))
-            current_chunk = [section]
-            current_size = section_size
-        else:
-            current_chunk.append(section)
-            current_size += section_size
+        # Start new chunk on major section headers (h1, h2), but only if we have content
+        if header_match and len(header_match.group(1)) <= 2:
+            if len(current_chunk) > 1:  # Only flush if we have more than just a header
+                current_size = flush_chunk()
+            current_section = line
+            current_chunk.append(line)
+            current_size = line_size
+            continue
+            
+        # If adding this line would exceed max size
+        if current_size + line_size > max_chunk_size:
+            current_size = flush_chunk()
+            if current_section:
+                current_chunk.append(current_section)
+                current_size = len(current_section) + 1
+        
+        current_chunk.append(line)
+        current_size += line_size
     
     # Add remaining content
     if current_chunk:
@@ -509,9 +545,18 @@ def save_optimized_markdown(text, output_dir, title, provider='deepseek'):
     # Detect paper type once for consistency
     paper_type = detect_paper_type(text, title, 'untitled', provider)
     
-    if len(chunks) == 1:
+    # Filter out chunks that only contain the title
+    filtered_chunks = [
+        chunk for chunk in chunks 
+        if not (
+            chunk.strip().endswith(title) or  # Skip if chunk only contains title
+            chunk.strip() == f"# {title}"     # Skip if chunk is just a header with title
+        )
+    ]
+    
+    if len(filtered_chunks) == 1:
         # Single file if content fits context window
-        content = add_frontmatter(chunks[0], title, paper_type=paper_type)
+        content = add_frontmatter(filtered_chunks[0], title, paper_type=paper_type)
         (output_dir / f"{safe_title}.md").write_text(content, encoding='utf-8')
     else:
         # Create directory for split content
@@ -527,7 +572,7 @@ def save_optimized_markdown(text, output_dir, title, provider='deepseek'):
         )
         
         # Save chunks with proper linking
-        for i, chunk in enumerate(chunks, 1):
+        for i, chunk in enumerate(filtered_chunks, 1):
             chunk_file = f"part_{i:02d}.md"
             # Add frontmatter to each chunk with part number
             content = add_frontmatter(
